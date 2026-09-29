@@ -1,4 +1,5 @@
 import Dexie, { type Table } from 'dexie'
+import type { ArchiveRecord } from '@/types/archive'
 import type { Hall } from '@/types/hall'
 import type { Element } from '@/types/element'
 import type { PaintLayer } from '@/types/layer'
@@ -6,7 +7,7 @@ import type { Decay } from '@/types/decay'
 import type { RepairStep } from '@/types/repair'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -35,6 +36,8 @@ export interface BackupPayload {
   layers: PaintLayer[]
   decays: Decay[]
   repairSteps: RepairStep[]
+  /** 会审档案（草稿 + 历史快照，含 parentId 版本链）；旧备份不含此字段 */
+  archives: ArchiveRecord[]
 }
 
 export class MuralArchDatabase extends Dexie {
@@ -43,6 +46,7 @@ export class MuralArchDatabase extends Dexie {
   layers!: Table<PaintLayer, string>
   decays!: Table<Decay, string>
   repairSteps!: Table<RepairStep, string>
+  archives!: Table<ArchiveRecord, string>
 
   constructor() {
     super('gbmuralarch')
@@ -54,7 +58,7 @@ export class MuralArchDatabase extends Dexie {
       repairSteps: 'id, decayId, seq, state, updatedAt'
     })
     // v2：病害表补充 repairedAt 索引，工序表补充 name 索引
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         halls: 'id, name, era, structureType, roofType, updatedAt',
         elements: 'id, hallId, position, status, updatedAt',
@@ -76,6 +80,28 @@ export class MuralArchDatabase extends Dexie {
             }
           })
       })
+    // v3：会审档案表；殿宇表补充当前版本指针
+    this.version(DB_VERSION)
+      .stores({
+        halls: 'id, name, era, structureType, roofType, currentVersionId, updatedAt',
+        elements: 'id, hallId, position, status, updatedAt',
+        layers: 'id, elementId, level, patternName, pigment',
+        decays: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
+        repairSteps: 'id, decayId, seq, name, state, updatedAt',
+        archives: 'id, hallId, kind, seq, parentId, archivedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 存量殿宇没有版本指针，统一回填为 null（尚未产生任何会审版本）
+        type LegacyHall = Omit<Hall, 'currentVersionId'> & { currentVersionId?: string | null }
+        await tx
+          .table<LegacyHall>('halls')
+          .toCollection()
+          .modify((hall) => {
+            if (hall.currentVersionId === undefined) {
+              hall.currentVersionId = null
+            }
+          })
+      })
   }
 }
 
@@ -91,14 +117,15 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.archives],
     async () => {
       await Promise.all([
         db.halls.clear(),
         db.elements.clear(),
         db.layers.clear(),
         db.decays.clear(),
-        db.repairSteps.clear()
+        db.repairSteps.clear(),
+        db.archives.clear()
       ])
     }
   )

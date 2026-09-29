@@ -9,14 +9,17 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useHallStore } from '@/stores/hallStore'
 import { useDecayStore } from '@/stores/decayStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useArchiveStore } from '@/stores/archiveStore'
 import { seedDemoData } from '@/utils/export'
 import { formatArea } from '@/utils/severity'
+import { versionLabel } from '@/types/archive'
 import { ROOF_TYPES, STRUCTURE_TYPES, type Hall, type RoofType, type StructureType } from '@/types/hall'
 
 const router = useRouter()
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
 const repairStore = useRepairStore()
+const archiveStore = useArchiveStore()
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -68,6 +71,10 @@ const cards = computed(() =>
       return decay?.hallId === hall.id
     })
     const doneSteps = steps.filter((step) => step.state === '已完成').length
+    const currentVersion = hall.currentVersionId
+      ? archiveStore.archiveById(hall.currentVersionId) ?? null
+      : null
+    const draft = archiveStore.draftOfHall(hall.id)
     return {
       hall,
       stat,
@@ -79,7 +86,10 @@ const cards = computed(() =>
       repairedPercent: stat?.repairedPercent ?? 0,
       risk,
       stepCount: steps.length,
-      doneSteps
+      doneSteps,
+      currentVersionLabel: currentVersion ? versionLabel(currentVersion) : null,
+      currentVersionTitle: currentVersion?.title ?? '',
+      hasDraft: Boolean(draft)
     }
   })
 )
@@ -135,6 +145,11 @@ function openDecays(hall: Hall): void {
 function openRepair(hall: Hall): void {
   hallStore.setCurrentHall(hall.id)
   void router.push('/repair')
+}
+
+function openArchives(hall: Hall): void {
+  hallStore.setCurrentHall(hall.id)
+  void router.push('/archives')
 }
 
 async function removeHall(hall: Hall): Promise<void> {
@@ -209,6 +224,13 @@ async function seed(): Promise<void> {
           <div>
             <h3>{{ card.hall.name }}</h3>
             <p class="muted">{{ card.hall.era }} · {{ card.hall.structureType }} · {{ card.hall.roofType }}顶</p>
+            <p class="version-line">
+              <el-tag v-if="card.currentVersionLabel" size="small" type="success" effect="plain">
+                当前版本 {{ card.currentVersionLabel }} · {{ card.currentVersionTitle }}
+              </el-tag>
+              <el-tag v-if="card.hasDraft" size="small" type="warning" effect="plain">会审草稿待归档</el-tag>
+              <span v-if="!card.currentVersionLabel && !card.hasDraft" class="muted">尚未会审归档</span>
+            </p>
           </div>
           <el-tag :type="card.unrepaired > 0 ? 'danger' : 'success'" effect="plain" round>
             {{ card.unrepaired > 0 ? `未修复 ${card.unrepaired}` : '病害已清' }}
@@ -258,6 +280,7 @@ async function seed(): Promise<void> {
           </el-button>
           <el-button size="small" :icon="Position" @click="openDecays(card.hall)">病害档案</el-button>
           <el-button size="small" :icon="Tools" @click="openRepair(card.hall)">修复工序</el-button>
+          <el-button size="small" type="success" plain @click="openArchives(card.hall)">会审档案</el-button>
           <el-button size="small" type="danger" text @click="removeHall(card.hall)">删除</el-button>
         </footer>
       </article>
@@ -332,6 +355,13 @@ async function seed(): Promise<void> {
 .hall-card__head p {
   margin: 2px 0 0;
   font-size: 12px;
+}
+
+.version-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px !important;
 }
 
 .hall-card__badges {

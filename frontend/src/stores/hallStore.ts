@@ -175,8 +175,8 @@ export const useHallStore = defineStore('hall', () => {
     structureFilter.value = []
   }
 
-  async function createHall(payload: Omit<Hall, 'id' | 'createdAt' | 'updatedAt'>): Promise<Hall> {
-    const hall = await hallsTable.create(payload, 'hall')
+  async function createHall(payload: Omit<Hall, 'id' | 'createdAt' | 'updatedAt' | 'currentVersionId'>): Promise<Hall> {
+    const hall = await hallsTable.create({ ...payload, currentVersionId: null }, 'hall')
     currentHallId.value = hall.id
     return hall
   }
@@ -185,7 +185,11 @@ export const useHallStore = defineStore('hall', () => {
     await hallsTable.update(id, patch)
   }
 
-  /** 级联删除：殿宇 → 构件 → 层位 → 病害 → 工序 */
+  /**
+   * 级联删除：殿宇 → 构件 → 层位 → 病害 → 工序。
+   * 会审档案（草稿与历史快照）不在删除范围内：档案页仍列出这些断开的档案，
+   * 可通过恢复快照找回殿宇主记录及其数据；确认无用后由档案页单独清理草稿。
+   */
   async function removeHall(id: string): Promise<void> {
     const elementIds = elements.value.filter((element) => element.hallId === id).map((element) => element.id)
     const layerIds = layers.value

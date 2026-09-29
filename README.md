@@ -42,7 +42,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`，无 `any`） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、树、表单、对话框、时间线交互 |
 | 构建工具 | Vite 6 | 开发服务器端口 21801 |
-| 状态管理 | Pinia（setup store） | `hallStore` / `decayStore` / `repairStore` |
+| 状态管理 | Pinia（setup store） | `hallStore` / `decayStore` / `repairStore` / `archiveStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
 | 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与升级迁移逻辑 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
@@ -67,11 +67,12 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 
 | 路由 | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
-| `/halls` | 殿宇总览 | 新建殿宇、按年代与结构类型筛选，卡片回显病害总数与未修复数 | Hall、Element、PaintLayer、Decay |
+| `/halls` | 殿宇总览 | 新建殿宇、按年代与结构类型筛选，卡片回显病害总数、未修复数与当前会审版本 | Hall、Element、PaintLayer、Decay、ArchiveRecord |
 | `/halls/:id/elements` | 构件与层位 | 构件树 + 层位表格，新增构件与层位，挂接病害 | Element、PaintLayer、Decay |
 | `/decays` | 病害档案台 | 按类型 / 程度 / 颜料 / 殿宇 / 部位组合筛选，批量改严重程度与类型 | Decay、PaintLayer |
 | `/repair` | 修复工序时间线 | 拖拽调整工序先后，回填材料与责任人，完成即回写病害为已修复 | RepairStep、Decay |
-| `/backup` | 本地数据与备份 | 查看本地结构版本、JSON 导入导出、清空与样例数据 | 全部模型 |
+| `/archives` | 会审档案 | 按殿宇建立会审草稿、整包归档为历史快照、查看版本链、恢复快照、指出断开的记录 | ArchiveRecord 及全部业务模型 |
+| `/backup` | 本地数据与备份 | 查看本地结构版本、JSON 导入导出（含版本关系）、清空与样例数据 | 全部模型 |
 
 `/` 与未匹配路径均重定向到 `/halls`。
 
@@ -81,13 +82,22 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
-| Hall 殿宇 | `src/types/hall.ts` | `id` `name` `era` `structureType`（大木/小式） `roofType`（庑殿/歇山/悬山） | 新建后进入构件录入 |
+| Hall 殿宇 | `src/types/hall.ts` | `id` `name` `era` `structureType`（大木/小式） `roofType`（庑殿/歇山/悬山） `currentVersionId` | 新建后进入构件录入；`currentVersionId` 指向当前会审版本快照 |
 | Element 构件 | `src/types/element.ts` | `id` `hallId` `position`（檐下/室内/梁枋/斗拱/天花） `name` `layerCount` `baseLayer` `status`（完好/观察/待修） | 按殿宇与部位二维筛选 |
 | PaintLayer 彩画层位 | `src/types/layer.ts` | `id` `elementId` `level`（由外至内） `patternName`（旋子/和玺/苏式） `pigment`（石青/石绿/朱砂/土黄） `thicknessMm` | 层位顺次叠压 |
 | Decay 病害记录 | `src/types/decay.ts` | `id` `layerId` `type`（起甲/剥落/空鼓/粉化/龟裂） `severity`（轻度/中度/重度） `areaCm2` `causeGuess` `repaired` | 同层位可叠加多条并汇总到殿宇 |
 | RepairStep 修复工序 | `src/types/repair.ts` | `id` `decayId` `seq` `name`（除尘/回贴/灌浆/补绘/封护） `material` `operator` `state`（未开始/进行中/已完成） | 拖拽排序，完成回写病害 |
+| ArchiveRecord 会审档案 | `src/types/archive.ts` | `id` `hallId` `kind`（draft/snapshot） `seq` `parentId` `restoredFromId` `bundle` `brokenRefs` | 每座殿宇的草稿与历史快照版本链，整包含殿宇+构件+层位+病害+工序 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
+### 会审版本机制
+
+- **草稿（draft）**：一座殿宇至多一份。复查记录在工作数据上改完后「同步当前数据」刷新草稿整包，避免新判断直接覆盖旧判断。
+- **归档（snapshot）**：归档前对整包做引用完整性校验（父级缺失、悬空外键、同表 id 重复）。**有断开记录时整批不写任何半成品**，断链明细落盘到草稿并在档案页逐条指出；通过后草稿转为不可变快照，`seq` 自增，`parentId` 指向上一版，殿宇 `currentVersionId` 指向新快照。
+- **版本链**：旧备份导入的「初始版本」固定 `seq=0`、`parentId=null`；会审归档从 `V1` 起依次递增。
+- **恢复快照**：在单事务内沿「殿宇→构件→层位→病害→工序」链清空该殿宇当前工作数据并整包写回，`currentVersionId` 回到所选快照；**原快照与其后的所有档案均保留**，并可选派生一份「恢复后会审」草稿。
+- **断开档案**：删除殿宇只级联删除工作数据，会审档案保留；档案页单列「断开的档案」，包内殿宇主记录完整时可一键重建殿宇。
+
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：新增 `archives` 表与 Hall 的 `currentVersionId` 字段（v1→v2 的 `repairedAt` 迁移保留）。
 
 ---
 
@@ -97,15 +107,16 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 sologsb-1101/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts
-│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts
+│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts archive.ts
+│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts archiveStore.ts
 │   │   ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
 │   │   ├── hooks/                # useDecayFilter.ts useIdbTable.ts
-│   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue BackupView.vue
+│   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue ArchiveView.vue BackupView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # severity.ts db.ts export.ts
+│   │   ├── utils/                # severity.ts db.ts export.ts archive.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
+│   ├── scripts/                  # 档案版本逻辑与 Dexie 集成校验（npm run test:archives）
 │   ├── public/favicon.svg
 │   ├── index.html package.json tsconfig.json vite.config.ts
 ├── Dockerfile                    # 多阶段构建（node:20-alpine → nginx:alpine）
@@ -122,9 +133,9 @@ sologsb-1101/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：5 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
+- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：6 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps` / `archives`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；业务表增删改查通过 `src/hooks/useIdbTable.ts` 封装并用 `liveQuery` 响应式订阅，档案版本的归档 / 恢复在 `src/stores/archiveStore.ts` 中以单事务保证一致性。
 - **localStorage**：仅存元数据 —— `gbmuralarch:db-version`（本地结构版本）、`gbmuralarch:last-backup-at`（最近一次导出时间）、`gbmuralarch:ui-prefs`（当前选中殿宇、工序排序方式）。
-- **备份**：`/backup` 页面可导出 JSON（含 5 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性；支持「覆盖导入」与「追加导入（重新分配 id）」两种模式。
+- **备份**：`/backup` 页面可导出 JSON（含 6 张表全量数据、结构版本与会审档案版本链 `parentId` / `restoredFromId` / `currentVersionId`），导入时先校验 `app` 字段与各集合数组完整性；支持「覆盖导入」与「追加导入（连版本链一起重新分配 id）」两种模式。**无 `archives` 字段的旧备份**会被识别为旧格式：导入时为每座殿宇生成 `seq=0` 的「初始版本」快照，再导出的文件即带全版本关系。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---
@@ -132,5 +143,6 @@ sologsb-1101/
 ## 八、开发提示
 
 - 类型检查与构建：`cd frontend && npm run build`（含 `vue-tsc --noEmit`，必须零错误）。
+- 档案版本校验：`cd frontend && npm run test:archives`（纯逻辑断言 + 基于 fake-indexeddb 的 Dexie/Pinia 集成测试）。
 - 端口一致性：开发服务器（`vite.config.ts`）、预览服务、compose 的 `FRONTEND_PORT` 默认值均为 `21801`。
 - 若部署在中文路径下，`docker-compose.yml` 顶层的 `name: gbmuralarch` 可保证项目名不为空，`docker compose config --quiet` 不会报错。

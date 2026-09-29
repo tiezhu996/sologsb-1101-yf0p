@@ -9,6 +9,8 @@ export interface Hall {
   era: string
   structureType: StructureType
   roofType: RoofType
+  /** 当前版本快照 id：null 表示会审后尚未归档过（仍是工作数据） */
+  currentVersionId: string | null
   createdAt: number
   updatedAt: number
 }

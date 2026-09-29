@@ -7,6 +7,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useHallStore } from '@/stores/hallStore'
 import { useDecayStore } from '@/stores/decayStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useArchiveStore } from '@/stores/archiveStore'
 import {
   DB_VERSION,
   clearAllTables,
@@ -27,12 +28,14 @@ import { formatArea } from '@/utils/severity'
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
 const repairStore = useRepairStore()
+const archiveStore = useArchiveStore()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const importOverwrite = ref(true)
 const lastBackupAt = ref<string | null>(null)
 const stampedVersion = ref<number>(DB_VERSION)
 const importPreview = ref<BackupPayload | null>(null)
+const importLegacy = ref(false)
 const importErrors = ref<string[]>([])
 const importing = ref(false)
 const exporting = ref(false)
@@ -47,11 +50,13 @@ const counts = computed(() => ({
   elements: hallStore.elements.length,
   layers: hallStore.layers.length,
   decays: decayStore.decays.length,
-  repairSteps: repairStore.steps.length
+  repairSteps: repairStore.steps.length,
+  snapshots: archiveStore.archives.filter((record) => record.kind === 'snapshot').length,
+  drafts: archiveStore.archives.filter((record) => record.kind === 'draft').length
 }))
 
 const storageRows = computed(() => [
-  { table: 'halls（殿宇）', key: 'id, name, era, structureType, roofType, updatedAt', count: counts.value.halls },
+  { table: 'halls（殿宇）', key: 'id, name, era, structureType, roofType, currentVersionId, updatedAt', count: counts.value.halls },
   { table: 'elements（构件）', key: 'id, hallId, position, status, updatedAt', count: counts.value.elements },
   { table: 'layers（彩画层位）', key: 'id, elementId, level, patternName, pigment', count: counts.value.layers },
   {
@@ -59,7 +64,8 @@ const storageRows = computed(() => [
     key: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
     count: counts.value.decays
   },
-  { table: 'repairSteps（工序）', key: 'id, decayId, seq, name, state, updatedAt', count: counts.value.repairSteps }
+  { table: 'repairSteps（工序）', key: 'id, decayId, seq, name, state, updatedAt', count: counts.value.repairSteps },
+  { table: 'archives（会审档案）', key: 'id, hallId, kind, seq, parentId, archivedAt', count: counts.value.snapshots + counts.value.drafts }
 ])
 
 const localStorageRows = computed(() => [
@@ -94,6 +100,7 @@ async function onFileChange(event: Event): Promise<void> {
   if (!file) return
   importErrors.value = []
   importPreview.value = null
+  importLegacy.value = false
   try {
     const text = await readFileText(file)
     const parsed: unknown = JSON.parse(text)
@@ -104,7 +111,12 @@ async function onFileChange(event: Event): Promise<void> {
       return
     }
     importPreview.value = result.payload
-    ElMessage.success('备份文件校验通过，确认后即可导入')
+    importLegacy.value = result.legacy
+    ElMessage.success(
+      result.legacy
+        ? '检测到无版本信息的旧备份，导入后每座殿宇将归为「初始版本」'
+        : '备份文件校验通过，确认后即可导入'
+    )
   } catch {
     importErrors.value = ['文件不是合法的 JSON，或读取过程中出现异常']
     ElMessage.error('无法解析该文件')
@@ -115,20 +127,25 @@ async function confirmImport(): Promise<void> {
   if (!importPreview.value) return
   importing.value = true
   try {
-    const payload = importOverwrite.value ? importPreview.value : remapIds(importPreview.value)
+    const payload = importOverwrite.value
+      ? importPreview.value
+      : remapIds(importPreview.value, importLegacy.value)
     const confirmed = await ElMessageBox.confirm(
       importOverwrite.value
         ? '覆盖导入将清空当前全部本地数据后写入备份内容，是否继续？'
-        : '追加导入会为备份数据重新分配 id 并保留现有档案，是否继续？',
+        : '追加导入会为备份数据（含版本关系）重新分配 id 并保留现有档案，是否继续？',
       '导入确认',
       { type: 'warning', confirmButtonText: '开始导入', cancelButtonText: '取消' }
     ).catch(() => false)
     if (!confirmed) return
-    const result = await importBackup(payload, importOverwrite.value)
+    const result = await importBackup(payload, importOverwrite.value, importLegacy.value)
     ElMessage.success(
-      `导入完成：殿宇 ${result.halls} / 构件 ${result.elements} / 层位 ${result.layers} / 病害 ${result.decays} / 工序 ${result.repairSteps}`
+      importLegacy.value
+        ? `旧备份导入完成，已为 ${result.initials} 座殿宇归为「初始版本」：殿宇 ${result.halls} / 构件 ${result.elements} / 层位 ${result.layers} / 病害 ${result.decays} / 工序 ${result.repairSteps}`
+        : `导入完成：殿宇 ${result.halls} / 构件 ${result.elements} / 层位 ${result.layers} / 病害 ${result.decays} / 工序 ${result.repairSteps} / 档案 ${result.archives}`
     )
     importPreview.value = null
+    importLegacy.value = false
   } finally {
     importing.value = false
   }
@@ -153,16 +170,17 @@ async function doSeed(): Promise<void> {
   ElMessage.success('已生成本地样例档案')
 }
 
-function previewCount(payload: BackupPayload, key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>): number {
+function previewCount(payload: BackupPayload, key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps' | 'archives'>): number {
   return payload[key].length
 }
 
-const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>; label: string }> = [
+const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps' | 'archives'>; label: string }> = [
   { key: 'halls', label: '殿宇' },
   { key: 'elements', label: '构件' },
   { key: 'layers', label: '层位' },
   { key: 'decays', label: '病害' },
-  { key: 'repairSteps', label: '工序' }
+  { key: 'repairSteps', label: '工序' },
+  { key: 'archives', label: '会审档案' }
 ]
 </script>
 
@@ -188,6 +206,8 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
       <StatBadge label="彩画层位" :value="counts.layers" suffix="层" icon="Files" />
       <StatBadge label="病害记录" :value="counts.decays" suffix="条" icon="Histogram" tone="warning" />
       <StatBadge label="工序" :value="counts.repairSteps" suffix="道" icon="Tools" tone="success" />
+      <StatBadge label="历史快照" :value="counts.snapshots" suffix="版" icon="Files" tone="primary" />
+      <StatBadge label="会审草稿" :value="counts.drafts" suffix="份" icon="EditPen" />
       <StatBadge label="病害总面积" :value="formatArea(decayStore.totalArea)" icon="PieChart" />
     </div>
 
@@ -214,7 +234,7 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
         </el-table-column>
       </el-table>
       <p class="muted storage-note">
-        版本 1 → 2 的迁移：decays 表补充 repairedAt 索引，修复状态字段缺失的历史数据按 updatedAt 回填。
+        版本 2 → 3 的迁移：新增 archives 会审档案表（草稿 + 历史快照 + parentId 版本链），halls 表补充 currentVersionId 当前版本指针；v1→v2 的 decays.repairedAt 回填逻辑保留。
       </p>
     </div>
 
@@ -247,6 +267,13 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
         <div class="import-preview__head">
           <strong>待导入文件校验通过</strong>
           <span class="muted">导出时间：{{ importPreview.exportedAt }} · 文件版本 v{{ importPreview.dbVersion }}</span>
+        </div>
+        <div v-if="importLegacy" class="legacy-tip">
+          <el-icon><WarnTriangleFilled /></el-icon>
+          <span>
+            该备份不含版本信息（旧格式）。导入后将为每座殿宇自动生成 seq=0 的「初始版本」历史快照，
+            殿宇的构件、层位、病害、工序整包归入该版本，再导出时会携带完整版本关系。
+          </span>
         </div>
         <div class="import-preview__counts">
           <el-tag v-for="item in previewKeys" :key="item.key" effect="plain" round>
@@ -348,6 +375,24 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.legacy-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: #fdf7e8;
+  border: 1px solid #f0d9ac;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #8a5a2b;
+}
+
+.legacy-tip .el-icon {
+  margin-top: 2px;
+  flex-shrink: 0;
 }
 
 .import-preview__actions {
