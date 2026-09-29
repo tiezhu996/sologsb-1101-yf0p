@@ -36,6 +36,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '本地数据与备份', icon: 'Coin' }
   },
   {
+    path: '/versions',
+    name: 'version-archive',
+    component: () => import('@/pages/VersionArchive.vue'),
+    meta: { title: '档案版本', icon: 'Archive' }
+  },
+  {
     path: '/:pathMatch(.*)*',
     redirect: '/halls'
   }

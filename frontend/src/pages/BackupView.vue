@@ -7,6 +7,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useHallStore } from '@/stores/hallStore'
 import { useDecayStore } from '@/stores/decayStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useVersionStore } from '@/stores/versionStore'
 import {
   DB_VERSION,
   clearAllTables,
@@ -27,6 +28,7 @@ import { formatArea } from '@/utils/severity'
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
 const repairStore = useRepairStore()
+const versionStore = useVersionStore()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const importOverwrite = ref(true)
@@ -47,7 +49,8 @@ const counts = computed(() => ({
   elements: hallStore.elements.length,
   layers: hallStore.layers.length,
   decays: decayStore.decays.length,
-  repairSteps: repairStore.steps.length
+  repairSteps: repairStore.steps.length,
+  versions: versionStore.versions.length
 }))
 
 const storageRows = computed(() => [
@@ -59,7 +62,8 @@ const storageRows = computed(() => [
     key: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
     count: counts.value.decays
   },
-  { table: 'repairSteps（工序）', key: 'id, decayId, seq, name, state, updatedAt', count: counts.value.repairSteps }
+  { table: 'repairSteps（工序）', key: 'id, decayId, seq, name, state, updatedAt', count: counts.value.repairSteps },
+  { table: 'archiveVersions（档案版本）', key: 'id, hallId, versionNo, status, archivedAt, updatedAt', count: counts.value.versions }
 ])
 
 const localStorageRows = computed(() => [
@@ -76,7 +80,7 @@ async function doExport(): Promise<void> {
     const result = await exportBackupJson()
     lastBackupAt.value = readLastBackupAt()
     ElMessage.success(
-      `已导出 ${result.fileName}（殿宇 ${result.counts.halls} / 构件 ${result.counts.elements} / 层位 ${result.counts.layers} / 病害 ${result.counts.decays} / 工序 ${result.counts.repairSteps}）`
+      `已导出 ${result.fileName}（殿宇 ${result.counts.halls} / 构件 ${result.counts.elements} / 层位 ${result.counts.layers} / 病害 ${result.counts.decays} / 工序 ${result.counts.repairSteps} / 版本 ${result.counts.versions}）`
     )
   } finally {
     exporting.value = false
@@ -126,7 +130,7 @@ async function confirmImport(): Promise<void> {
     if (!confirmed) return
     const result = await importBackup(payload, importOverwrite.value)
     ElMessage.success(
-      `导入完成：殿宇 ${result.halls} / 构件 ${result.elements} / 层位 ${result.layers} / 病害 ${result.decays} / 工序 ${result.repairSteps}`
+      `导入完成：殿宇 ${result.halls} / 构件 ${result.elements} / 层位 ${result.layers} / 病害 ${result.decays} / 工序 ${result.repairSteps} / 版本 ${result.versions}`
     )
     importPreview.value = null
   } finally {
@@ -136,7 +140,7 @@ async function confirmImport(): Promise<void> {
 
 async function doClear(): Promise<void> {
   const confirmed = await ElMessageBox.confirm(
-    '将清空浏览器 IndexedDB 中的全部业务数据（殿宇、构件、层位、病害、工序），此操作不可撤销。是否继续？',
+    '将清空浏览器 IndexedDB 中的全部业务数据（殿宇、构件、层位、病害、工序、档案版本），此操作不可撤销。是否继续？',
     '清空本地数据',
     { type: 'error', confirmButtonText: '确认清空', cancelButtonText: '取消' }
   ).catch(() => false)
@@ -153,16 +157,18 @@ async function doSeed(): Promise<void> {
   ElMessage.success('已生成本地样例档案')
 }
 
-function previewCount(payload: BackupPayload, key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>): number {
-  return payload[key].length
+function previewCount(payload: BackupPayload, key: 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps' | 'versions'): number {
+  const value = payload[key]
+  return Array.isArray(value) ? value.length : 0
 }
 
-const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>; label: string }> = [
+const previewKeys: Array<{ key: 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps' | 'versions'; label: string }> = [
   { key: 'halls', label: '殿宇' },
   { key: 'elements', label: '构件' },
   { key: 'layers', label: '层位' },
   { key: 'decays', label: '病害' },
-  { key: 'repairSteps', label: '工序' }
+  { key: 'repairSteps', label: '工序' },
+  { key: 'versions', label: '档案版本' }
 ]
 </script>
 
@@ -188,6 +194,7 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
       <StatBadge label="彩画层位" :value="counts.layers" suffix="层" icon="Files" />
       <StatBadge label="病害记录" :value="counts.decays" suffix="条" icon="Histogram" tone="warning" />
       <StatBadge label="工序" :value="counts.repairSteps" suffix="道" icon="Tools" tone="success" />
+      <StatBadge label="档案版本" :value="counts.versions" suffix="份" icon="Archive" tone="primary" />
       <StatBadge label="病害总面积" :value="formatArea(decayStore.totalArea)" icon="PieChart" />
     </div>
 
@@ -214,7 +221,8 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
         </el-table-column>
       </el-table>
       <p class="muted storage-note">
-        版本 1 → 2 的迁移：decays 表补充 repairedAt 索引，修复状态字段缺失的历史数据按 updatedAt 回填。
+        版本 2 → 3 的迁移：新增 archiveVersions 表，用于固化每座殿宇的会审快照（草稿版本与历史快照）。
+        旧版备份导入时会自动为每座殿宇生成「初始版本」归档快照。
       </p>
     </div>
 

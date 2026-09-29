@@ -6,6 +6,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import type { ArchiveVersion } from '@/types/version'
 
 /** 校验备份对象的必备字段，返回错误信息数组（为空表示通过） */
 export function validateBackup(input: unknown): { ok: boolean; errors: string[]; payload: BackupPayload | null } {
@@ -34,19 +35,21 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     elements: obj.elements ?? [],
     layers: obj.layers ?? [],
     decays: obj.decays ?? [],
-    repairSteps: obj.repairSteps ?? []
+    repairSteps: obj.repairSteps ?? [],
+    versions: Array.isArray(obj.versions) ? obj.versions : undefined
   }
   return { ok: true, errors, payload }
 }
 
-/** 组装当前本地数据的备份对象 */
+/** 组装当前本地数据的备份对象（含档案版本） */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [halls, elements, layers, decays, repairSteps] = await Promise.all([
+  const [halls, elements, layers, decays, repairSteps, versions] = await Promise.all([
     db.halls.toArray(),
     db.elements.toArray(),
     db.layers.toArray(),
     db.decays.toArray(),
-    db.repairSteps.toArray()
+    db.repairSteps.toArray(),
+    db.archiveVersions.toArray()
   ])
   return {
     app: 'gbmuralarch',
@@ -56,7 +59,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     elements,
     layers,
     decays,
-    repairSteps
+    repairSteps,
+    versions
   }
 }
 
@@ -81,7 +85,8 @@ export async function exportBackupJson(): Promise<{ fileName: string; counts: Re
       elements: payload.elements.length,
       layers: payload.layers.length,
       decays: payload.decays.length,
-      repairSteps: payload.repairSteps.length
+      repairSteps: payload.repairSteps.length,
+      versions: payload.versions?.length ?? 0
     }
   }
 }
@@ -102,15 +107,23 @@ export async function importBackup(
   overwrite: boolean
 ): Promise<Record<string, number>> {
   if (overwrite) await clearAllTables()
+
+  // 旧版备份没有版本信息：为每座殿宇创建「初始版本」归档快照
+  const hasVersions = Array.isArray(payload.versions) && payload.versions.length > 0
+  const versionsToImport: ArchiveVersion[] = hasVersions
+    ? (payload.versions as ArchiveVersion[])
+    : buildInitialVersions(payload)
+
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.archiveVersions],
     async () => {
       await db.halls.bulkPut(payload.halls)
       await db.elements.bulkPut(payload.elements)
       await db.layers.bulkPut(payload.layers)
       await db.decays.bulkPut(payload.decays)
       await db.repairSteps.bulkPut(payload.repairSteps)
+      if (versionsToImport.length > 0) await db.archiveVersions.bulkPut(versionsToImport)
     }
   )
   return {
@@ -118,8 +131,45 @@ export async function importBackup(
     elements: payload.elements.length,
     layers: payload.layers.length,
     decays: payload.decays.length,
-    repairSteps: payload.repairSteps.length
+    repairSteps: payload.repairSteps.length,
+    versions: versionsToImport.length
   }
+}
+
+/**
+ * 旧版备份（无版本信息）导入后，为每座殿宇生成「初始版本」归档快照。
+ * 快照内容从备份数据中按殿宇筛选组装。
+ */
+function buildInitialVersions(payload: BackupPayload): ArchiveVersion[] {
+  const now = Date.now()
+  return payload.halls.map((hall) => {
+    const hallElementIds = new Set(
+      payload.elements.filter((el) => el.hallId === hall.id).map((el) => el.id)
+    )
+    const hallLayers = payload.layers.filter((layer) => hallElementIds.has(layer.elementId))
+    const hallLayerIds = new Set(hallLayers.map((layer) => layer.id))
+    const hallDecays = payload.decays.filter((decay) => hallLayerIds.has(decay.layerId))
+    const hallDecayIds = new Set(hallDecays.map((decay) => decay.id))
+    const hallSteps = payload.repairSteps.filter((step) => hallDecayIds.has(step.decayId))
+
+    return {
+      id: createId('ver'),
+      versionNo: 1,
+      hallId: hall.id,
+      status: 'archived' as const,
+      note: '初始版本（旧备份导入）',
+      archivedAt: now,
+      createdAt: now,
+      updatedAt: now,
+      snapshot: {
+        hall,
+        elements: payload.elements.filter((el) => el.hallId === hall.id),
+        layers: hallLayers,
+        decays: hallDecays,
+        repairSteps: hallSteps
+      }
+    }
+  })
 }
 
 /** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
@@ -154,7 +204,44 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('step'),
     decayId: decayIdMap.get(step.decayId) ?? step.decayId
   }))
-  return { ...payload, halls, elements, layers, decays, repairSteps }
+
+  // 版本档案：重新分配 id，并同步快照内的引用
+  const versions = (payload.versions ?? []).map((version) => {
+    const id = createId('ver')
+    const snapshot = {
+      hall: version.snapshot.hall
+        ? { ...version.snapshot.hall, id: hallIdMap.get(version.snapshot.hall.id) ?? version.snapshot.hall.id }
+        : version.snapshot.hall,
+      elements: version.snapshot.elements.map((el) => ({
+        ...el,
+        id: elementIdMap.get(el.id) ?? el.id,
+        hallId: hallIdMap.get(el.hallId) ?? el.hallId
+      })),
+      layers: version.snapshot.layers.map((layer) => ({
+        ...layer,
+        id: layerIdMap.get(layer.id) ?? layer.id,
+        elementId: elementIdMap.get(layer.elementId) ?? layer.elementId
+      })),
+      decays: version.snapshot.decays.map((decay) => ({
+        ...decay,
+        id: decayIdMap.get(decay.id) ?? decay.id,
+        layerId: layerIdMap.get(decay.layerId) ?? decay.layerId
+      })),
+      repairSteps: version.snapshot.repairSteps.map((step) => ({
+        ...step,
+        id: createId('step'),
+        decayId: decayIdMap.get(step.decayId) ?? step.decayId
+      }))
+    }
+    return {
+      ...version,
+      id,
+      hallId: hallIdMap.get(version.hallId) ?? version.hallId,
+      snapshot
+    }
+  })
+
+  return { ...payload, halls, elements, layers, decays, repairSteps, versions }
 }
 
 /** 生成演示样例数据，便于首次打开即可看到完整链路 */
@@ -167,48 +254,50 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.archiveVersions],
     async () => {
-      await db.halls.put({
+      const hall = {
         id: hallId,
         name: '大雄宝殿',
         era: '明嘉靖',
-        structureType: '大木',
-        roofType: '庑殿',
+        structureType: '大木' as const,
+        roofType: '庑殿' as const,
         createdAt: now,
         updatedAt: now
-      })
-      await db.elements.bulkPut([
+      }
+      await db.halls.put(hall)
+      const elements = [
         {
           id: elementIds[0],
           hallId,
-          position: '檐下',
+          position: '檐下' as const,
           name: '前檐明间额枋',
           layerCount: 2,
           baseLayer: '一麻五灰',
-          status: '待修',
+          status: '待修' as const,
           createdAt: now,
           updatedAt: now
         },
         {
           id: elementIds[1],
           hallId,
-          position: '梁枋',
+          position: '梁枋' as const,
           name: '七架梁',
           layerCount: 1,
           baseLayer: '单披灰',
-          status: '观察',
+          status: '观察' as const,
           createdAt: now,
           updatedAt: now
         }
-      ])
-      await db.layers.bulkPut([
+      ]
+      await db.elements.bulkPut(elements)
+      const layers = [
         {
           id: layerIds[0],
           elementId: elementIds[0],
           level: 1,
-          patternName: '旋子',
-          pigment: '石青',
+          patternName: '旋子' as const,
+          pigment: '石青' as const,
           thicknessMm: 1.8,
           createdAt: now,
           updatedAt: now
@@ -217,19 +306,20 @@ export async function seedDemoData(): Promise<void> {
           id: layerIds[1],
           elementId: elementIds[1],
           level: 1,
-          patternName: '苏式',
-          pigment: '土黄',
+          patternName: '苏式' as const,
+          pigment: '土黄' as const,
           thicknessMm: 1.2,
           createdAt: now,
           updatedAt: now
         }
-      ])
-      await db.decays.bulkPut([
+      ]
+      await db.layers.bulkPut(layers)
+      const decays = [
         {
           id: decayIds[0],
           layerId: layerIds[0],
-          type: '起甲',
-          severity: '重度',
+          type: '起甲' as const,
+          severity: '重度' as const,
           areaCm2: 320.5,
           causeGuess: '地仗层脱胶，受檐口渗水影响',
           repaired: false,
@@ -240,8 +330,8 @@ export async function seedDemoData(): Promise<void> {
         {
           id: decayIds[1],
           layerId: layerIds[1],
-          type: '龟裂',
-          severity: '中度',
+          type: '龟裂' as const,
+          severity: '中度' as const,
           areaCm2: 158,
           causeGuess: '木构件干缩引起画面开裂',
           repaired: false,
@@ -249,16 +339,17 @@ export async function seedDemoData(): Promise<void> {
           createdAt: now,
           updatedAt: now
         }
-      ])
-      await db.repairSteps.bulkPut([
+      ]
+      await db.decays.bulkPut(decays)
+      const repairSteps = [
         {
           id: createId('step'),
           decayId: decayIds[0],
           seq: 1,
-          name: '除尘',
+          name: '除尘' as const,
           material: '软毛刷 + 去离子水',
           operator: '李文博',
-          state: '已完成',
+          state: '已完成' as const,
           createdAt: now,
           updatedAt: now
         },
@@ -266,14 +357,28 @@ export async function seedDemoData(): Promise<void> {
           id: createId('step'),
           decayId: decayIds[0],
           seq: 2,
-          name: '回贴',
+          name: '回贴' as const,
           material: '鱼鳔胶（2% 明矾水调和）',
           operator: '李文博',
-          state: '进行中',
+          state: '进行中' as const,
           createdAt: now,
           updatedAt: now
         }
-      ])
+      ]
+      await db.repairSteps.bulkPut(repairSteps)
+
+      // 为样例殿宇创建初始版本归档快照
+      await db.archiveVersions.put({
+        id: createId('ver'),
+        versionNo: 1,
+        hallId,
+        status: 'archived',
+        note: '初始版本（样例数据）',
+        archivedAt: now,
+        createdAt: now,
+        updatedAt: now,
+        snapshot: { hall, elements, layers, decays, repairSteps }
+      })
     }
   )
 }

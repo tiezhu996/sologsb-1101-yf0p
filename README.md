@@ -2,7 +2,7 @@
 
 面向文物建筑彩画勘察与修复人员的本地化档案工具：把殿宇内每处彩画层位的病害现状逐条落档，并按工序安排修复先后。
 
-核心动作：**录入殿宇与构件 → 圈定彩画层位 → 判定病害类型与程度 → 挂接修复工序并跟踪进度**。
+核心动作：**录入殿宇与构件 → 圈定彩画层位 → 判定病害类型与程度 → 挂接修复工序并跟踪进度 → 会审留档形成版本快照**。
 
 纯前端单页应用（Vue 3 + TypeScript + Element Plus + Vite + Pinia + Vue Router），**无后端、无数据库服务、无 API 服务**，全部数据保存在浏览器本地（IndexedDB / Dexie + 少量 localStorage 元数据），刷新或重启浏览器后仍然存在。
 
@@ -71,6 +71,7 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | `/halls/:id/elements` | 构件与层位 | 构件树 + 层位表格，新增构件与层位，挂接病害 | Element、PaintLayer、Decay |
 | `/decays` | 病害档案台 | 按类型 / 程度 / 颜料 / 殿宇 / 部位组合筛选，批量改严重程度与类型 | Decay、PaintLayer |
 | `/repair` | 修复工序时间线 | 拖拽调整工序先后，回填材料与责任人，完成即回写病害为已修复 | RepairStep、Decay |
+| `/versions` | 档案版本 | 每座殿宇的会审草稿与历史快照，归档校验引用完整性，快照可恢复为当前版本 | ArchiveVersion、Hall、Element、PaintLayer、Decay、RepairStep |
 | `/backup` | 本地数据与备份 | 查看本地结构版本、JSON 导入导出、清空与样例数据 | 全部模型 |
 
 `/` 与未匹配路径均重定向到 `/halls`。
@@ -86,8 +87,9 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | PaintLayer 彩画层位 | `src/types/layer.ts` | `id` `elementId` `level`（由外至内） `patternName`（旋子/和玺/苏式） `pigment`（石青/石绿/朱砂/土黄） `thicknessMm` | 层位顺次叠压 |
 | Decay 病害记录 | `src/types/decay.ts` | `id` `layerId` `type`（起甲/剥落/空鼓/粉化/龟裂） `severity`（轻度/中度/重度） `areaCm2` `causeGuess` `repaired` | 同层位可叠加多条并汇总到殿宇 |
 | RepairStep 修复工序 | `src/types/repair.ts` | `id` `decayId` `seq` `name`（除尘/回贴/灌浆/补绘/封护） `material` `operator` `state`（未开始/进行中/已完成） | 拖拽排序，完成回写病害 |
+| ArchiveVersion 档案版本 | `src/types/version.ts` | `id` `versionNo` `hallId` `status`（draft/archived） `note` `archivedAt` `snapshot`（固化的 Hall+Element+PaintLayer+Decay+RepairStep） | 会审留档，草稿可刷新，归档后不可变，快照可恢复 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：新增 `archiveVersions` 表固化每座殿宇的会审快照。v2 迁移为 `decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
 
 ---
 
@@ -97,13 +99,13 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 sologsb-1101/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts
-│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts
+│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts version.ts
+│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts versionStore.ts
 │   │   ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
 │   │   ├── hooks/                # useDecayFilter.ts useIdbTable.ts
-│   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue BackupView.vue
+│   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue VersionArchive.vue BackupView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # severity.ts db.ts export.ts
+│   │   ├── utils/                # severity.ts db.ts export.ts version.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
 │   ├── public/favicon.svg
@@ -122,9 +124,10 @@ sologsb-1101/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：5 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
+- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：6 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps` / `archiveVersions`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
 - **localStorage**：仅存元数据 —— `gbmuralarch:db-version`（本地结构版本）、`gbmuralarch:last-backup-at`（最近一次导出时间）、`gbmuralarch:ui-prefs`（当前选中殿宇、工序排序方式）。
-- **备份**：`/backup` 页面可导出 JSON（含 5 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性；支持「覆盖导入」与「追加导入（重新分配 id）」两种模式。
+- **备份**：`/backup` 页面可导出 JSON（含 6 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性；支持「覆盖导入」与「追加导入（重新分配 id）」两种模式。旧版备份无版本信息，导入后自动为每座殿宇生成「初始版本」归档快照。
+- **版本档案**：`/versions` 页面为每座殿宇建立会审草稿，草稿捕获当前殿宇的完整数据（构件、层位、病害、工序）；归档时校验引用完整性（父级缺失或引用不完整则整批不写入），通过后固化为历史快照；快照可恢复为当前工作版本，原快照与后续档案保留不变。页面同时标出主数据中的断开引用记录。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---
